@@ -4,10 +4,12 @@ import { useEffect, useRef, useState } from "react";
 import type { Cauldron, ChatMessage, IngredientOption, IngredientsManifest } from "@/types";
 import IngredientBlock from "./IngredientBlock";
 import CookingBar from "./CookingBar";
+import { OPTIONS } from "@/lib/ingredients";
 
 type LoadPhase = "thinking" | "ingredients" | "done";
 
 interface Message extends ChatMessage {
+  id: string;
   manifest?: IngredientsManifest;
   phase?: LoadPhase;
 }
@@ -17,6 +19,70 @@ interface Props {
   cauldrons: Cauldron[];
   onAddChip: (cauldronId: string, option: IngredientOption) => void;
   onNewCauldron: (option: IngredientOption) => void;
+}
+
+// Client-side keyword fallback — always produces chips even if manifest API fails
+function fallbackManifest(text: string): IngredientsManifest {
+  const lower = text.toLowerCase();
+  const KEYWORD_MAP: Record<string, string[]> = {
+    storage:      ["image", "photo", "file", "upload", "media", "video", "picture"],
+    search:       ["search", "find", "filter", "browse", "discover"],
+    payments:     ["pay", "payment", "checkout", "buy", "sell", "money", "stripe", "subscription"],
+    database:     ["data", "store", "save", "user", "account", "profile", "record"],
+    auth:         ["login", "sign", "auth", "user", "account", "register", "member"],
+    email:        ["email", "notify", "notification", "newsletter", "contact", "message"],
+    maps:         ["map", "location", "address", "delivery", "restaurant", "nearby", "local"],
+    "ai-provider":["ai", "gpt", "openai", "claude", "llm", "generate", "chat", "assistant"],
+  };
+
+  const scored = Object.entries(KEYWORD_MAP)
+    .map(([id, keywords]) => ({
+      id,
+      score: keywords.filter((kw) => lower.includes(kw)).length,
+    }))
+    .filter((e) => e.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5)
+    .map((e) => e.id);
+
+  // Always include database + auth as defaults if nothing matched
+  const ids = scored.length > 0 ? scored : ["database", "auth", "storage"];
+
+  const categories = ids
+    .filter((id) => id in OPTIONS)
+    .map((id) => {
+      const catId = id as keyof typeof OPTIONS;
+      const opts = OPTIONS[catId];
+      return {
+        id: catId,
+        label: labelFor(id),
+        description: descFor(id),
+        color: opts[0].color,
+        options: opts,
+      };
+    });
+
+  return { appType: "app", categories };
+}
+
+function labelFor(id: string) {
+  const m: Record<string, string> = {
+    storage: "File Storage", search: "Search", style: "Style",
+    payments: "Payments", database: "Database", auth: "Auth",
+    email: "Email", maps: "Maps", "ai-provider": "AI Provider",
+  };
+  return m[id] ?? id;
+}
+
+function descFor(id: string) {
+  const m: Record<string, string> = {
+    storage: "store and serve files", search: "let users search content",
+    style: "visual feel of the app", payments: "handle money",
+    database: "store your data", auth: "log users in",
+    email: "send transactional email", maps: "show locations",
+    "ai-provider": "add AI features",
+  };
+  return m[id] ?? "";
 }
 
 export default function Chat({ initialMessage, cauldrons, onAddChip, onNewCauldron }: Props) {
@@ -38,31 +104,35 @@ export default function Chat({ initialMessage, cauldrons, onAddChip, onNewCauldr
   }, [messages]);
 
   async function sendMessage(text: string) {
-    const userMsg: Message = { role: "user", content: text };
+    const userMsg: Message = { id: crypto.randomUUID(), role: "user", content: text };
+    const assistantId = crypto.randomUUID();
     const history = messages.map((m) => ({ role: m.role, content: m.content }));
 
-    // Add user message + empty assistant slot in "thinking" phase
-    const assistantIdx = messages.length + 1;
     setMessages((prev) => [
       ...prev,
       userMsg,
-      { role: "assistant", content: "", phase: "thinking" },
+      { id: assistantId, role: "assistant", content: "", phase: "thinking" },
     ]);
     setBusy(true);
 
+    // helper: update the assistant message by ID (safe regardless of array length)
+    const update = (patch: Partial<Message>) =>
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, ...patch } : m))
+      );
+
     try {
-      // Phase 1 — stream prose
+      // Phase 1 — stream chat response
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, history }),
       });
 
-      if (!res.ok) {
+      if (!res.ok || !res.body) {
         const body = await res.json().catch(() => ({}));
-        throw new Error(body.error ?? `Chat API error: ${res.status}`);
+        throw new Error(body.error ?? `Chat error ${res.status}`);
       }
-      if (!res.body) throw new Error("No response body");
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -72,52 +142,40 @@ export default function Chat({ initialMessage, cauldrons, onAddChip, onNewCauldr
         const { done, value } = await reader.read();
         if (done) break;
         accum += decoder.decode(value, { stream: true });
-        const snap = accum;
-        setMessages((prev) => {
-          const updated = [...prev];
-          updated[assistantIdx] = { ...updated[assistantIdx], content: snap };
-          return updated;
-        });
+        update({ content: accum });
       }
 
-      // Brief pause to ensure the 70B stream fully releases before the 3B manifest call
-      await new Promise((r) => setTimeout(r, 800));
+      // Phase 2 — fetch ingredient manifest
+      update({ phase: "ingredients" });
 
-      // Phase 2 — fetch manifest
-      setMessages((prev) => {
-        const updated = [...prev];
-        updated[assistantIdx] = { ...updated[assistantIdx], phase: "ingredients" };
-        return updated;
-      });
+      let manifest: IngredientsManifest | null = null;
 
-      const mRes = await fetch("/api/manifest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
-      });
+      try {
+        const mRes = await fetch("/api/manifest", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text }),
+        });
 
-      const manifest: IngredientsManifest = await mRes.json();
+        if (mRes.ok) {
+          const data: IngredientsManifest = await mRes.json();
+          if (data.categories && data.categories.length > 0) {
+            manifest = data;
+          }
+        }
+      } catch {
+        // manifest API failed — fall through to client fallback below
+      }
 
-      setMessages((prev) => {
-        const updated = [...prev];
-        updated[assistantIdx] = {
-          ...updated[assistantIdx],
-          manifest: manifest.categories.length > 0 ? manifest : undefined,
-          phase: "done",
-        };
-        return updated;
-      });
+      // Always show chips: use API result or keyword fallback
+      if (!manifest) {
+        manifest = fallbackManifest(text);
+      }
+
+      update({ manifest, phase: "done" });
     } catch (err) {
       console.error(err);
-      setMessages((prev) => {
-        const updated = [...prev];
-        updated[assistantIdx] = {
-          ...updated[assistantIdx],
-          content: "Something went wrong. Try again.",
-          phase: "done",
-        };
-        return updated;
-      });
+      update({ content: "Something went wrong. Try again.", phase: "done" });
     } finally {
       setBusy(false);
     }
@@ -135,9 +193,9 @@ export default function Chat({ initialMessage, cauldrons, onAddChip, onNewCauldr
     <div className="flex flex-col h-full">
       {/* Messages */}
       <div className="flex-1 overflow-y-auto flex flex-col gap-5 px-5 py-5">
-        {messages.map((msg, i) => (
+        {messages.map((msg) => (
           <div
-            key={i}
+            key={msg.id}
             className={`flex flex-col gap-1 ${msg.role === "user" ? "items-end" : "items-start"}`}
           >
             {/* Bubble */}
@@ -155,14 +213,14 @@ export default function Chat({ initialMessage, cauldrons, onAddChip, onNewCauldr
               )}
             </div>
 
-            {/* Cooking bar — only on assistant messages still loading */}
+            {/* Loading bar — only while thinking or fetching ingredients */}
             {msg.role === "assistant" && msg.phase && msg.phase !== "done" && (
               <div className="w-full max-w-[85%]">
                 <CookingBar phase={msg.phase} />
               </div>
             )}
 
-            {/* Ingredient chips — appear when manifest is ready */}
+            {/* Ingredient chips */}
             {msg.role === "assistant" && msg.manifest && (
               <div className="w-full mt-2 flex flex-col gap-4">
                 {msg.manifest.categories.map((cat) => (
