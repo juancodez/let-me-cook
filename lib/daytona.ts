@@ -8,7 +8,11 @@ export async function cookCauldron(
   chips: CauldronChip[],
   appDescription: string
 ): Promise<{ previewUrl: string }> {
-  const daytona = new Daytona();
+  const apiKey = process.env.DAYTONA_API_KEY;
+  if (!apiKey) throw new Error("DAYTONA_API_KEY is not configured on this deployment.");
+
+  // Pass the key explicitly so the SDK never falls back to file-based env reading
+  const daytona = new Daytona({ apiKey });
 
   // 1. Generate the HTML preview with AI
   const html = await generatePreviewHtml(chips, appDescription);
